@@ -347,6 +347,112 @@ def terminate_runpod_pod():
 
 
 # ---------------------------------------------------------------------------
+# Greedy Worker Loop — Keep processing jobs while queue has work for this model
+# ---------------------------------------------------------------------------
+GREEDY_MAX_JOBS_PER_DRAIN = int(os.getenv("GREEDY_MAX_JOBS", "20"))
+GREEDY_IDLE_TIMEOUT = float(os.getenv("GREEDY_IDLE_TIMEOUT", "30"))  # seconds to wait before giving up
+
+
+def drain_queue_for_model(model_name: str, max_jobs: int = GREEDY_MAX_JOBS_PER_DRAIN) -> list[dict]:
+    """Pull up to max_jobs pending jobs for the given model from the Redis queue.
+
+    Only takes jobs that match our model. Jobs for other models are pushed back.
+    """
+    claimed = []
+    returned = []
+
+    # Pop all available jobs and filter
+    while len(claimed) < max_jobs:
+        job_id = r.rpop("jobs:pending")
+        if not job_id:
+            break
+
+        raw = r.get(f"{JOB_PREFIX}{job_id}")
+        if not raw:
+            continue
+
+        job = json.loads(raw)
+        if job.get("model") == model_name:
+            claimed.append(job)
+        else:
+            # Not for us — push back to the front of the queue
+            returned.append(job_id)
+
+    # Return non-matching jobs back to the queue (push to right = back of queue)
+    for job_id in reversed(returned):
+        r.lpush("jobs:pending", job_id)
+
+    if claimed:
+        log.info(f"Greedy drain: claimed {len(claimed)} jobs for {model_name}, returned {len(returned)} others")
+    return claimed
+
+
+def greedy_worker_loop(model_name: str, process_batch_fn, container_start: float):
+    """Keep draining the queue and processing jobs until no more work exists for this model.
+
+    Args:
+        model_name: The model this worker handles (e.g. "flux-kontext")
+        process_batch_fn: Callable that takes a list of job dicts and processes them.
+                          Signature: process_batch_fn(jobs: list[dict]) -> None
+        container_start: Timestamp when the container started (for billing)
+
+    After all work is done (or queue is empty for this model), terminates the pod.
+    """
+    import time as _time
+
+    total_processed = 0
+    idle_start = None
+
+    while True:
+        jobs = drain_queue_for_model(model_name)
+
+        if jobs:
+            idle_start = None
+            # Enrich with user info from Redis
+            jobs = enrich_jobs(jobs, model_name)
+            total_processed += len(jobs)
+
+            log.info(f"Greedy loop: processing {len(jobs)} additional jobs (total so far: {total_processed})")
+
+            try:
+                process_batch_fn(jobs)
+            except Exception as e:
+                log.error(f"Greedy loop batch processing error: {e}")
+                # Mark remaining jobs as failed
+                for job in jobs:
+                    try:
+                        mark_job_failed(job["job_id"], f"Worker error: {e}")
+                    except Exception:
+                        pass
+
+            # Write billing for this mini-batch
+            batch_end = _time.time()
+            try:
+                write_billing_records(
+                    str(uuid.uuid4()), jobs, container_start, batch_end, model_name
+                )
+            except Exception as e:
+                log.error(f"Billing write failed: {e}")
+            # Update container_start for next billing window
+            container_start = batch_end
+        else:
+            # No jobs found — wait a bit before checking again
+            if idle_start is None:
+                idle_start = _time.time()
+                log.info(f"Greedy loop: queue empty for {model_name}, waiting up to {GREEDY_IDLE_TIMEOUT}s...")
+
+            elapsed_idle = _time.time() - idle_start
+            if elapsed_idle >= GREEDY_IDLE_TIMEOUT:
+                log.info(f"Greedy loop: idle for {elapsed_idle:.0f}s, no more work. "
+                         f"Total processed: {total_processed}. Terminating pod.")
+                break
+
+            _time.sleep(2)  # Poll every 2 seconds
+
+    terminate_runpod_pod()
+
+
+# ---------------------------------------------------------------------------
 # Asset Downloads
 # ---------------------------------------------------------------------------
 def download_asset(url: str, dest_dir: str, filename: str | None = None) -> str:
