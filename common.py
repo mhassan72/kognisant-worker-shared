@@ -49,11 +49,24 @@ log = logging.getLogger("worker")
 # ---------------------------------------------------------------------------
 # Init Firebase
 # ---------------------------------------------------------------------------
-if os.path.exists(FIREBASE_CREDENTIALS_PATH):
+_firebase_creds_b64 = os.getenv("FIREBASE_CREDENTIALS_B64", "")
+
+if _firebase_creds_b64:
+    import base64, tempfile as _tf
+    _creds_data = base64.b64decode(_firebase_creds_b64)
+    _tmp = _tf.NamedTemporaryFile(mode="wb", suffix=".json", delete=False)
+    _tmp.write(_creds_data)
+    _tmp.close()
+    cred = credentials.Certificate(_tmp.name)
+    firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_STORAGE_BUCKET})
+    log.info("Firebase initialized from FIREBASE_CREDENTIALS_B64 env var")
+elif os.path.exists(FIREBASE_CREDENTIALS_PATH):
     cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
     firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_STORAGE_BUCKET})
+    log.info(f"Firebase initialized from {FIREBASE_CREDENTIALS_PATH}")
 else:
     firebase_admin.initialize_app(options={"storageBucket": FIREBASE_STORAGE_BUCKET})
+    log.warning("Firebase initialized without credentials — some features may not work")
 
 db = firestore.client()
 bucket: Bucket = storage.bucket()
