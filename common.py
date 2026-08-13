@@ -317,6 +317,36 @@ def enrich_jobs(jobs: list[dict], model_name: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# RunPod Self-Termination
+# ---------------------------------------------------------------------------
+def terminate_runpod_pod():
+    """Terminate the current RunPod pod via API to stop billing.
+    Call this after all jobs are done or on fatal error.
+    """
+    pod_id = os.getenv("RUNPOD_POD_ID", "")
+    api_key = os.getenv("RUNPOD_API_KEY", "")
+    if not pod_id or not api_key:
+        log.warning("RUNPOD_POD_ID or RUNPOD_API_KEY not set — cannot self-terminate")
+        return
+    query = """
+    mutation podTerminate($input: PodTerminateInput!) {
+        podTerminate(input: $input)
+    }
+    """
+    variables = {"input": {"podId": pod_id}}
+    try:
+        resp = httpx.post(
+            "https://api.runpod.io/graphql",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            json={"query": query, "variables": variables},
+            timeout=15,
+        )
+        log.info(f"RunPod pod {pod_id} terminate response: {resp.status_code}")
+    except Exception as e:
+        log.error(f"Failed to terminate RunPod pod: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Asset Downloads
 # ---------------------------------------------------------------------------
 def download_asset(url: str, dest_dir: str, filename: str | None = None) -> str:
