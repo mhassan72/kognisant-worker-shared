@@ -277,14 +277,26 @@ class BatchProgress:
         return _callback
 
 
-def mark_job_completed(job_id: str, result_url: str, hls_url: str):
-    """Mark job as completed with result URLs."""
+def is_job_cancelled(job_id: str) -> bool:
+    """Check if a job has been cancelled by the user.
+    Workers should call this before starting each job in a batch.
+    """
+    raw = r.get(f"{JOB_PREFIX}{job_id}")
+    if not raw:
+        return False
+    data = json.loads(raw)
+    return data.get("status") == "cancelled"
+
+
+def mark_job_completed(job_id: str, result_url: str, hls_url: str, **extra):
+    """Mark job as completed with result URLs and optional variant URLs."""
     publish_progress(
         job_id, 100, "Complete",
         status="completed",
         result_url=result_url,
         hls_url=hls_url,
         completed_at=time.time(),
+        **extra,
     )
 
     # Persist generation record to Firestore
@@ -304,6 +316,8 @@ def mark_job_completed(job_id: str, result_url: str, hls_url: str):
                 "height": job_data.get("height"),
                 "result_url": result_url,
                 "hls_url": hls_url,
+                "thumbnail_url": extra.get("thumbnail_url"),
+                "preview_url": extra.get("preview_url"),
                 "status": "completed",
                 "created_at": job_data.get("created_at"),
                 "completed_at": time.time(),
@@ -424,6 +438,63 @@ def upload_file(local_path: str, remote_path: str) -> str:
     blob.upload_from_filename(local_path)
     blob.make_public()
     return blob.public_url
+
+
+def upload_image_with_variants(local_path: str, job_id: str) -> dict[str, str]:
+    """Generate image variants (thumb, preview, micro) and upload all to Firebase Storage.
+
+    Returns dict with URLs:
+        {
+            "original_url": "...",
+            "full_url": "...",       # full-res WebP
+            "preview_url": "...",    # 640px wide WebP
+            "thumbnail_url": "...", # 320px wide WebP
+            "micro_url": "...",     # 64px wide WebP (LQIP placeholder)
+        }
+    """
+    from PIL import Image, ImageFilter
+
+    img = Image.open(local_path).convert("RGB")
+    base_dir = os.path.dirname(local_path)
+    prefix = f"images/{job_id}"
+    urls = {}
+
+    # 1. Original PNG (as-is)
+    urls["original_url"] = upload_file(local_path, f"{prefix}/original.png")
+
+    # 2. Full-res WebP
+    full_path = os.path.join(base_dir, "full.webp")
+    img.save(full_path, "WEBP", quality=85)
+    urls["full_url"] = upload_file(full_path, f"{prefix}/full.webp")
+
+    # 3. Preview (640px wide)
+    w, h = img.size
+    preview_w = 640
+    preview_h = int(h * (preview_w / w))
+    preview = img.resize((preview_w, preview_h), Image.LANCZOS)
+    preview_path = os.path.join(base_dir, "preview.webp")
+    preview.save(preview_path, "WEBP", quality=80)
+    urls["preview_url"] = upload_file(preview_path, f"{prefix}/preview.webp")
+
+    # 4. Thumbnail (320px wide)
+    thumb_w = 320
+    thumb_h = int(h * (thumb_w / w))
+    thumb = img.resize((thumb_w, thumb_h), Image.LANCZOS)
+    thumb_path = os.path.join(base_dir, "thumb.webp")
+    thumb.save(thumb_path, "WEBP", quality=70)
+    urls["thumbnail_url"] = upload_file(thumb_path, f"{prefix}/thumb.webp")
+
+    # 5. Micro LQIP (64px wide, blurred)
+    micro_w = 64
+    micro_h = int(h * (micro_w / w))
+    micro = img.resize((micro_w, micro_h), Image.LANCZOS)
+    micro = micro.filter(ImageFilter.GaussianBlur(radius=2))
+    micro_path = os.path.join(base_dir, "micro.webp")
+    micro.save(micro_path, "WEBP", quality=50)
+    urls["micro_url"] = upload_file(micro_path, f"{prefix}/micro.webp")
+
+    log.info(f"Uploaded image with 5 variants for job {job_id}")
+    return urls
 
 
 def upload_directory(local_dir: str, remote_prefix: str):
