@@ -32,7 +32,7 @@ from google.cloud.storage import Bucket
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis.batch-inference.svc.cluster.local:6379")
 FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH", "/secrets/firebase.json")
 FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "")
-MARGIN_MULTIPLIER = float(os.getenv("MARGIN_MULTIPLIER", "1.3"))
+MARGIN_MULTIPLIER = float(os.getenv("MARGIN_MULTIPLIER", "1.8"))
 
 JOB_PREFIX = "job:"
 PROGRESS_CHANNEL = "job:progress:{job_id}"
@@ -180,24 +180,64 @@ def mark_job_failed(job_id: str, error: str):
 # ---------------------------------------------------------------------------
 # HLS Transcoding
 # ---------------------------------------------------------------------------
-def transcode_to_hls(input_path: str, output_dir: str) -> str:
-    """Transcode mp4 to HLS segments using ffmpeg. Returns playlist path."""
-    os.makedirs(output_dir, exist_ok=True)
-    playlist_path = os.path.join(output_dir, "playlist.m3u8")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
+def _hls_common_args(output_dir: str, playlist_path: str) -> list[str]:
+    return [
         "-pix_fmt", "yuv420p",
         "-hls_time", "4",
         "-hls_list_size", "0",
         "-hls_segment_filename", os.path.join(output_dir, "segment_%03d.ts"),
         playlist_path,
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def transcode_to_hls(input_path: str, output_dir: str) -> str:
+    """Transcode mp4 to HLS segments using ffmpeg. Returns playlist path.
+
+    Uses NVENC hardware encoding when available — we are already paying for a
+    GPU, and h264_nvenc is roughly 5-10x faster than libx264 on CPU. Transcode
+    is ~23% of pod cost with libx264, so this matters.
+    Falls back to libx264 if NVENC is unavailable or fails.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    playlist_path = os.path.join(output_dir, "playlist.m3u8")
+    tail = _hls_common_args(output_dir, playlist_path)
+
+    nvenc_cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c:v", "h264_nvenc",
+        "-preset", "p4",
+        "-rc", "vbr",
+        "-cq", "23",
+        *tail,
+    ]
+
+    try:
+        subprocess.run(nvenc_cmd, check=True, capture_output=True)
+        log.info("HLS transcode complete (h264_nvenc)")
+        return playlist_path
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        stderr = getattr(e, "stderr", None)
+        detail = (stderr or b"").decode(errors="replace")[-500:] if stderr else str(e)
+        log.warning(f"NVENC transcode failed, falling back to libx264: {detail}")
+        # A partial NVENC run may have left segments behind. Clear them so the
+        # fallback encode does not leave stale .ts files to be uploaded.
+        for stale in Path(output_dir).glob("segment_*.ts"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+    x264_cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        *tail,
+    ]
+    subprocess.run(x264_cmd, check=True, capture_output=True)
+    log.info("HLS transcode complete (libx264 fallback)")
     return playlist_path
 
 
@@ -350,7 +390,10 @@ def terminate_runpod_pod():
 # Greedy Worker Loop — Keep processing jobs while queue has work for this model
 # ---------------------------------------------------------------------------
 GREEDY_MAX_JOBS_PER_DRAIN = int(os.getenv("GREEDY_MAX_JOBS", "20"))
-GREEDY_IDLE_TIMEOUT = float(os.getenv("GREEDY_IDLE_TIMEOUT", "30"))  # seconds to wait before giving up
+# Seconds to wait for more work before self-terminating.
+# Every pod pays this once: 30s costs $0.0116 on A100, $0.0083 on L40S.
+# The batcher dispatches within ~1s of a job landing in Redis, so 5s is ample.
+GREEDY_IDLE_TIMEOUT = float(os.getenv("GREEDY_IDLE_TIMEOUT", "5"))
 
 
 def drain_queue_for_model(model_name: str, max_jobs: int = GREEDY_MAX_JOBS_PER_DRAIN) -> list[dict]:
