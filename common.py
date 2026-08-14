@@ -80,13 +80,61 @@ r = redis.from_url(REDIS_URL, decode_responses=True)
 # ---------------------------------------------------------------------------
 # Progress
 # ---------------------------------------------------------------------------
+
+# GPU rates ($/ms) for live cost calculation — must match batcher's GPU routing
+GPU_RATES = {
+    "NVIDIA L40S": 0.000000275,
+    "NVIDIA A100 80GB PCIe": 0.000000386,
+    "NVIDIA A100-80GB": 0.000000386,
+    "NVIDIA RTX A5000": 0.000000075,
+    "NVIDIA RTX 4090": 0.000000192,
+    "NVIDIA A40": 0.000000122,
+    "NVIDIA L4": 0.000000108,
+}
+
+# Detect GPU type and rate at startup
+_GPU_TYPE = os.getenv("RUNPOD_GPU_TYPE", os.getenv("GPU_TYPE", ""))
+_RATE_PER_MS = GPU_RATES.get(_GPU_TYPE, 0.000000275)  # default L40S
+_CONTAINER_START: float = 0  # set by the worker at startup
+
+
+def set_container_start(t: float):
+    """Call at the beginning of main() to enable elapsed/cost tracking."""
+    global _CONTAINER_START
+    _CONTAINER_START = t
+
+
+def _cost_so_far() -> float:
+    """Current cost based on elapsed time since container start."""
+    if not _CONTAINER_START:
+        return 0.0
+    elapsed_ms = (time.time() - _CONTAINER_START) * 1000
+    return elapsed_ms * _RATE_PER_MS * MARGIN_MULTIPLIER
+
+
+def _elapsed_ms() -> int:
+    if not _CONTAINER_START:
+        return 0
+    return int((time.time() - _CONTAINER_START) * 1000)
+
+
 def publish_progress(job_id: str, progress: int, message: str, status: str = "processing", **extra):
-    """Publish progress to Redis Pub/Sub and update job hash."""
+    """Publish progress to Redis Pub/Sub and update job hash.
+
+    Automatically includes elapsed_ms, cost_so_far_usd, gpu_type, and rate_per_ms.
+    """
+    progress = max(0, min(100, int(progress)))
+
     event = {
         "job_id": job_id,
         "status": status,
         "progress": progress,
         "progress_message": message,
+        "elapsed_ms": _elapsed_ms(),
+        "cost_so_far_usd": round(_cost_so_far(), 6),
+        "gpu_type": _GPU_TYPE,
+        "rate_per_ms": _RATE_PER_MS,
+        "margin_multiplier": MARGIN_MULTIPLIER,
         **extra,
     }
 
@@ -99,8 +147,134 @@ def publish_progress(job_id: str, progress: int, message: str, status: str = "pr
         data["status"] = status
         data["progress"] = progress
         data["progress_message"] = message
+        data["elapsed_ms"] = event["elapsed_ms"]
+        data["cost_so_far_usd"] = event["cost_so_far_usd"]
         data.update(extra)
         r.set(f"{JOB_PREFIX}{job_id}", json.dumps(data))
+
+
+# ---------------------------------------------------------------------------
+# Batch Progress Tracker
+# ---------------------------------------------------------------------------
+class BatchProgress:
+    """Tracks progress across a batch of jobs and maps per-step diffusion
+    callbacks to smooth 1-100% per job, with stage labels.
+
+    Stages for image generation:
+        0-5%    : Queued / Loading model
+        5-10%   : Downloading assets
+        10-90%  : Generating (diffusion steps → maps linearly within this range)
+        90-95%  : Creating variants
+        95-99%  : Uploading
+        100%    : Complete
+
+    Stages for video generation:
+        0-5%    : Queued / Loading model
+        5-10%   : Downloading assets
+        10-80%  : Generating (diffusion steps)
+        80-90%  : Transcoding
+        90-95%  : Creating variants
+        95-99%  : Uploading
+        100%    : Complete
+    """
+
+    def __init__(self, job_ids: list[str], total_steps: int = 28, mode: str = "image"):
+        self.job_ids = job_ids
+        self.total_jobs = len(job_ids)
+        self.total_steps = total_steps
+        self.mode = mode
+        self.completed_jobs = 0
+
+        # Stage ranges depend on mode
+        if mode == "video":
+            self.gen_start = 10
+            self.gen_end = 80
+        else:
+            self.gen_start = 10
+            self.gen_end = 90
+
+    @property
+    def batch_progress(self) -> int:
+        """Overall batch progress as a percentage (0-100)."""
+        if self.total_jobs == 0:
+            return 100
+        return int((self.completed_jobs / self.total_jobs) * 100)
+
+    def on_queued(self, job_id: str):
+        publish_progress(job_id, 0, "Queued",
+                         stage="queued", batch_progress=self.batch_progress,
+                         batch_total=self.total_jobs, batch_completed=self.completed_jobs)
+
+    def on_model_loaded(self, job_id: str):
+        publish_progress(job_id, 5, "Model loaded",
+                         stage="model_loaded", batch_progress=self.batch_progress,
+                         batch_total=self.total_jobs, batch_completed=self.completed_jobs)
+
+    def on_downloading_assets(self, job_id: str):
+        publish_progress(job_id, 7, "Downloading assets",
+                         stage="downloading_assets", batch_progress=self.batch_progress,
+                         batch_total=self.total_jobs, batch_completed=self.completed_jobs)
+
+    def on_generating_start(self, job_id: str):
+        publish_progress(job_id, self.gen_start, "Generating",
+                         stage="generating", batch_progress=self.batch_progress,
+                         batch_total=self.total_jobs, batch_completed=self.completed_jobs)
+
+    def on_step(self, job_id: str, step: int, total_steps: int | None = None):
+        """Called after each diffusion step. Maps step to a smooth progress within
+        the generation range (gen_start to gen_end)."""
+        steps = total_steps or self.total_steps
+        if steps <= 0:
+            return
+        # Map step (1-based) to progress within gen range
+        fraction = step / steps
+        progress = int(self.gen_start + fraction * (self.gen_end - self.gen_start))
+        progress = max(self.gen_start, min(self.gen_end, progress))
+
+        publish_progress(job_id, progress, f"Generating (step {step}/{steps})",
+                         stage="generating", step=step, total_steps=steps,
+                         batch_progress=self.batch_progress,
+                         batch_total=self.total_jobs, batch_completed=self.completed_jobs)
+
+    def on_transcoding(self, job_id: str):
+        publish_progress(job_id, 82, "Transcoding to HLS",
+                         stage="transcoding", batch_progress=self.batch_progress,
+                         batch_total=self.total_jobs, batch_completed=self.completed_jobs)
+
+    def on_creating_variants(self, job_id: str):
+        pct = 91 if self.mode == "image" else 91
+        publish_progress(job_id, pct, "Creating image variants",
+                         stage="creating_variants", batch_progress=self.batch_progress,
+                         batch_total=self.total_jobs, batch_completed=self.completed_jobs)
+
+    def on_uploading(self, job_id: str):
+        pct = 95 if self.mode == "image" else 95
+        publish_progress(job_id, pct, "Uploading",
+                         stage="uploading", batch_progress=self.batch_progress,
+                         batch_total=self.total_jobs, batch_completed=self.completed_jobs)
+
+    def on_complete(self, job_id: str):
+        self.completed_jobs += 1
+        publish_progress(job_id, 100, "Complete", status="completed",
+                         stage="complete", batch_progress=self.batch_progress,
+                         batch_total=self.total_jobs, batch_completed=self.completed_jobs)
+
+    def on_failed(self, job_id: str, error: str):
+        self.completed_jobs += 1
+        publish_progress(job_id, 0, f"Failed: {error}", status="failed",
+                         stage="failed", error=error,
+                         batch_progress=self.batch_progress,
+                         batch_total=self.total_jobs, batch_completed=self.completed_jobs)
+
+    def make_step_callback(self, job_id: str):
+        """Return a callback function compatible with diffusers' callback_on_step_end.
+        Usage: pipe(..., callback_on_step_end=tracker.make_step_callback(job_id))
+        """
+        def _callback(pipe, step_index, timestep, callback_kwargs):
+            # step_index is 0-based, publish as 1-based
+            self.on_step(job_id, step_index + 1, self.total_steps)
+            return callback_kwargs
+        return _callback
 
 
 def mark_job_completed(job_id: str, result_url: str, hls_url: str):
