@@ -29,7 +29,7 @@ from google.cloud.storage import Bucket
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis.batch-inference.svc.cluster.local:6379")
+REDIS_URL = os.getenv("REDIS_URL", "redis://default:l3LuWXasyQQZPKgRmRw1lUAelrujDOUA@redis-17095.c279.us-central1-1.gce.cloud.redislabs.com:17095")
 FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH", "/secrets/firebase.json")
 FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "")
 MARGIN_MULTIPLIER = float(os.getenv("MARGIN_MULTIPLIER", "1.8"))
