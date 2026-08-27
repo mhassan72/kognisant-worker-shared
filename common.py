@@ -51,25 +51,30 @@ log = logging.getLogger("worker")
 # ---------------------------------------------------------------------------
 _firebase_creds_b64 = os.getenv("FIREBASE_CREDENTIALS_B64", "")
 
-if _firebase_creds_b64:
-    import base64, tempfile as _tf
-    _creds_data = base64.b64decode(_firebase_creds_b64)
-    _tmp = _tf.NamedTemporaryFile(mode="wb", suffix=".json", delete=False)
-    _tmp.write(_creds_data)
-    _tmp.close()
-    cred = credentials.Certificate(_tmp.name)
-    firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_STORAGE_BUCKET})
-    log.info("Firebase initialized from FIREBASE_CREDENTIALS_B64 env var")
-elif os.path.exists(FIREBASE_CREDENTIALS_PATH):
-    cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
-    firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_STORAGE_BUCKET})
-    log.info(f"Firebase initialized from {FIREBASE_CREDENTIALS_PATH}")
-else:
-    firebase_admin.initialize_app(options={"storageBucket": FIREBASE_STORAGE_BUCKET})
-    log.warning("Firebase initialized without credentials — some features may not work")
+try:
+    if _firebase_creds_b64:
+        import base64, tempfile as _tf
+        _creds_data = base64.b64decode(_firebase_creds_b64)
+        _tmp = _tf.NamedTemporaryFile(mode="wb", suffix=".json", delete=False)
+        _tmp.write(_creds_data)
+        _tmp.close()
+        cred = credentials.Certificate(_tmp.name)
+        firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_STORAGE_BUCKET})
+        log.info("Firebase initialized from FIREBASE_CREDENTIALS_B64 env var")
+    elif os.path.exists(FIREBASE_CREDENTIALS_PATH):
+        cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
+        firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_STORAGE_BUCKET})
+        log.info(f"Firebase initialized from {FIREBASE_CREDENTIALS_PATH}")
+    else:
+        firebase_admin.initialize_app(options={"storageBucket": FIREBASE_STORAGE_BUCKET})
+        log.warning("Firebase initialized without credentials — some features may not work")
 
-db = firestore.client()
-bucket: Bucket = storage.bucket()
+    db = firestore.client()
+    bucket: Bucket = storage.bucket()
+except Exception as e:
+    log.error(f"Firebase init failed: {e} — Firestore/Storage calls will fail gracefully")
+    db = None
+    bucket = None
 
 # ---------------------------------------------------------------------------
 # Init Redis
@@ -301,29 +306,32 @@ def mark_job_completed(job_id: str, result_url: str, hls_url: str, **extra):
 
     # Persist generation record to Firestore
     try:
-        raw = r.get(f"{JOB_PREFIX}{job_id}")
-        if raw:
-            job_data = json.loads(raw)
-            generation_doc = {
-                "user_id": job_data.get("user_id", "unknown"),
-                "job_id": job_id,
-                "model": job_data.get("model"),
-                "mode": job_data.get("mode", "text_to_video"),
-                "prompt": job_data.get("prompt"),
-                "inputs": job_data.get("inputs", {}),
-                "duration_seconds": job_data.get("duration_seconds"),
-                "width": job_data.get("width"),
-                "height": job_data.get("height"),
-                "result_url": result_url,
-                "hls_url": hls_url,
-                "thumbnail_url": extra.get("thumbnail_url"),
-                "preview_url": extra.get("preview_url"),
-                "status": "completed",
-                "created_at": job_data.get("created_at"),
-                "completed_at": time.time(),
-            }
-            db.collection("generations").document(job_id).set(generation_doc)
-            log.info(f"Generation record saved to Firestore: {job_id}")
+        if db is None:
+            log.warning("Firestore not available — skipping generation record")
+        else:
+            raw = r.get(f"{JOB_PREFIX}{job_id}")
+            if raw:
+                job_data = json.loads(raw)
+                generation_doc = {
+                    "user_id": job_data.get("user_id", "unknown"),
+                    "job_id": job_id,
+                    "model": job_data.get("model"),
+                    "mode": job_data.get("mode", "text_to_video"),
+                    "prompt": job_data.get("prompt"),
+                    "inputs": job_data.get("inputs", {}),
+                    "duration_seconds": job_data.get("duration_seconds"),
+                    "width": job_data.get("width"),
+                    "height": job_data.get("height"),
+                    "result_url": result_url,
+                    "hls_url": hls_url,
+                    "thumbnail_url": extra.get("thumbnail_url"),
+                    "preview_url": extra.get("preview_url"),
+                    "status": "completed",
+                    "created_at": job_data.get("created_at"),
+                    "completed_at": time.time(),
+                }
+                db.collection("generations").document(job_id).set(generation_doc)
+                log.info(f"Generation record saved to Firestore: {job_id}")
     except Exception as e:
         log.warning(f"Failed to write generation record: {e}")
 
@@ -339,28 +347,31 @@ def mark_job_failed(job_id: str, error: str):
 
     # Persist failed generation record to Firestore
     try:
-        raw = r.get(f"{JOB_PREFIX}{job_id}")
-        if raw:
-            job_data = json.loads(raw)
-            generation_doc = {
-                "user_id": job_data.get("user_id", "unknown"),
-                "job_id": job_id,
-                "model": job_data.get("model"),
-                "mode": job_data.get("mode", "text_to_video"),
-                "prompt": job_data.get("prompt"),
-                "inputs": job_data.get("inputs", {}),
-                "duration_seconds": job_data.get("duration_seconds"),
-                "width": job_data.get("width"),
-                "height": job_data.get("height"),
-                "result_url": None,
-                "hls_url": None,
-                "status": "failed",
-                "error": error,
-                "created_at": job_data.get("created_at"),
-                "completed_at": time.time(),
-            }
-            db.collection("generations").document(job_id).set(generation_doc)
-            log.info(f"Failed generation record saved to Firestore: {job_id}")
+        if db is None:
+            log.warning("Firestore not available — skipping failed generation record")
+        else:
+            raw = r.get(f"{JOB_PREFIX}{job_id}")
+            if raw:
+                job_data = json.loads(raw)
+                generation_doc = {
+                    "user_id": job_data.get("user_id", "unknown"),
+                    "job_id": job_id,
+                    "model": job_data.get("model"),
+                    "mode": job_data.get("mode", "text_to_video"),
+                    "prompt": job_data.get("prompt"),
+                    "inputs": job_data.get("inputs", {}),
+                    "duration_seconds": job_data.get("duration_seconds"),
+                    "width": job_data.get("width"),
+                    "height": job_data.get("height"),
+                    "result_url": None,
+                    "hls_url": None,
+                    "status": "failed",
+                    "error": error,
+                    "created_at": job_data.get("created_at"),
+                    "completed_at": time.time(),
+                }
+                db.collection("generations").document(job_id).set(generation_doc)
+                log.info(f"Failed generation record saved to Firestore: {job_id}")
     except Exception as e:
         log.warning(f"Failed to write generation record: {e}")
 
@@ -370,6 +381,8 @@ def mark_job_failed(job_id: str, error: str):
 # ---------------------------------------------------------------------------
 def _hls_common_args(output_dir: str, playlist_path: str) -> list[str]:
     return [
+        "-c:a", "aac",
+        "-b:a", "128k",
         "-pix_fmt", "yuv420p",
         "-hls_time", "4",
         "-hls_list_size", "0",
@@ -434,6 +447,8 @@ def transcode_to_hls(input_path: str, output_dir: str) -> str:
 # ---------------------------------------------------------------------------
 def upload_file(local_path: str, remote_path: str) -> str:
     """Upload a file to Firebase Storage and return its public URL."""
+    if bucket is None:
+        raise RuntimeError("Firebase Storage not available — cannot upload")
     blob = bucket.blob(remote_path)
     blob.upload_from_filename(local_path)
     blob.make_public()
@@ -521,6 +536,10 @@ def write_billing_records(
     model_name: str,
 ):
     """Write GPU usage records to Firestore for each job in the batch."""
+    if db is None:
+        log.warning("Firestore not available — skipping billing records")
+        return
+
     total_gpu_seconds = container_end - container_start
     batch_size = len(jobs)
 
@@ -645,12 +664,15 @@ def drain_queue_for_model(model_name: str, max_jobs: int = GREEDY_MAX_JOBS_PER_D
     """Pull up to max_jobs pending jobs for the given model from the Redis queue.
 
     Only takes jobs that match our model. Jobs for other models are pushed back.
+    Caps total items scanned per poll to avoid monopolizing Redis when the queue
+    is full of jobs for other models.
     """
     claimed = []
     returned = []
+    max_scan = 200  # Don't examine more than this per poll cycle
 
-    # Pop all available jobs and filter
-    while len(claimed) < max_jobs:
+    # Pop available jobs and filter
+    while len(claimed) < max_jobs and (len(claimed) + len(returned)) < max_scan:
         job_id = r.rpop("jobs:pending")
         if not job_id:
             break
@@ -713,16 +735,8 @@ def greedy_worker_loop(model_name: str, process_batch_fn, container_start: float
                     except Exception:
                         pass
 
-            # Write billing for this mini-batch
-            batch_end = _time.time()
-            try:
-                write_billing_records(
-                    str(uuid.uuid4()), jobs, container_start, batch_end, model_name
-                )
-            except Exception as e:
-                log.error(f"Billing write failed: {e}")
-            # Update container_start for next billing window
-            container_start = batch_end
+            # NOTE: Billing is handled inside process_batch_fn (per-worker).
+            # Do not write billing here to avoid duplicate records.
         else:
             # No jobs found — wait a bit before checking again
             if idle_start is None:
